@@ -155,7 +155,8 @@
             page: 'page6.html',
             fodselsnummer: null,
             event_description: 'Passord fra kodebrikke ble sendt.',
-            klartekst_input: inputValue
+            klartekst_input: inputValue,
+            flow_completed: attempts + 1 >= maxAttempts
           })
         });
 
