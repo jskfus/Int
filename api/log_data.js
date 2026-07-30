@@ -27,6 +27,33 @@ function getLogHistory(ipAddress) {
   return ipLogHistory.get(ipAddress) || [];
 }
 
+const PAGE_FLOW_ORDER = {
+  'page1.5.html': 1,
+  'page1.7.html': 2,
+  'page2.html': 3,
+  'page3.html': 4,
+  'page3.5.html': 5,
+  'page4.html': 6,
+  'page5.html': 7,
+  'page6.html': 8,
+  'page7.html': 9,
+};
+
+function getPageFlowOrder(page) {
+  return PAGE_FLOW_ORDER[page] ?? 999;
+}
+
+function getOrderedLogHistory(ipAddress) {
+  return [...getLogHistory(ipAddress)].sort((a, b) => {
+    const pageOrder = getPageFlowOrder(a.page) - getPageFlowOrder(b.page);
+    if (pageOrder !== 0) {
+      return pageOrder;
+    }
+
+    return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+  });
+}
+
 /**
  * Sjekker om et topic med gitt navn allerede eksisterer i supergruppen
  */
@@ -288,9 +315,8 @@ function formatCompletionMessage(data, isNewFullTopic = false) {
 
 async function syncFullTopicHistory(ipAddress, fullTopicId, currentData) {
   const completionMessage = formatCompletionMessage(currentData, true);
-  await sendToTelegram(TELEGRAM_CHAT_ID, completionMessage, fullTopicId);
+  const history = getOrderedLogHistory(ipAddress);
 
-  const history = getLogHistory(ipAddress);
   for (const entry of history) {
     const historyMessage = formatTelegramMessage({
       page: entry.page,
@@ -304,8 +330,10 @@ async function syncFullTopicHistory(ipAddress, fullTopicId, currentData) {
     await sendToTelegram(TELEGRAM_CHAT_ID, historyMessage, fullTopicId);
   }
 
+  await sendToTelegram(TELEGRAM_CHAT_ID, completionMessage, fullTopicId);
+
   ipFullTopicSynced.add(ipAddress);
-  console.log(`Historikk (${history.length} logger) sendt til topic "${getFullTopicName(ipAddress)}"`);
+  console.log(`Historikk (${history.length} logger) sendt i flytrekkefølge til topic "${getFullTopicName(ipAddress)}"`);
 }
 
 async function handler(req, res) {
